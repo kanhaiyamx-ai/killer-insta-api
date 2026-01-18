@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException
-import requests
+import httpx # You will need to add httpx to requirements.txt
 
 app = FastAPI()
 
@@ -16,8 +16,10 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "x-ig-app-id": "936619743392459",
     "accept": "*/*",
+    "accept-language": "en-US,en;q=0.9",
     "cookie": COOKIE_STRING,
-    "referer": "https://www.instagram.com/"
+    "referer": "https://www.instagram.com/",
+    "x-requested-with": "XMLHttpRequest" # Helps mimic a real web app request
 }
 
 @app.get("/")
@@ -25,38 +27,33 @@ def home():
     return {"status": "API is online", "usage": "/profile/{username}"}
 
 @app.get("/profile/{username}")
-def get_instagram_profile(username: str):
+async def get_instagram_profile(username: str):
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     
-    try:
-        response = requests.get(url, headers=HEADERS, timeout=15)
-        
-        if response.status_code != 200:
-            return {"error": f"Instagram returned {response.status_code}", "detail": "Check cookies"}
-
-        raw_data = response.json()
-        
-        # Safe navigation of the JSON tree
-        data = raw_data.get('data', {})
-        if not data:
-            return {"error": "No data key found", "raw": raw_data}
+    async with httpx.AsyncClient(http2=True) as client: # Use HTTP/2 to look more like a browser
+        try:
+            response = await client.get(url, headers=HEADERS, timeout=15.0)
             
-        user = data.get('user', {})
-        if not user:
-            return {"error": "User not found or profile is restricted", "raw": raw_data}
+            if response.status_code != 200:
+                return {"error": f"Instagram returned {response.status_code}", "raw": response.text}
 
-        # Success! Return the clean data
-        return {
-            "username": user.get("username"),
-            "full_name": user.get("full_name"),
-            "followers": user.get("edge_followed_by", {}).get("count"),
-            "following": user.get("edge_follow", {}).get("count"),
-            "posts": user.get("edge_owner_to_timeline_media", {}).get("count"),
-            "bio": user.get("biography"),
-            "profile_pic": user.get("profile_pic_url_hd"),
-            "is_private": user.get("is_private"),
-            "is_verified": user.get("is_verified")
-        }
+            data = response.json()
+            
+            # Instagram sometimes returns {"status": "ok"} but no data if you are flagged
+            if "data" not in data or not data["data"].get("user"):
+                return {
+                    "error": "Soft Block: Instagram returned status OK but hidden data.",
+                    "suggestion": "Log into your account on a browser and search for this user manually once to 'warm up' the session.",
+                    "raw_response": data
+                }
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            user = data["data"]["user"]
+            return {
+                "username": user.get("username"),
+                "followers": user.get("edge_followed_by", {}).get("count"),
+                "bio": user.get("biography"),
+                "profile_pic": user.get("profile_pic_url_hd")
+            }
+
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=str(e))
