@@ -1,22 +1,29 @@
-import os
-import random
 import time
+import random
 from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from curl_cffi import requests
 
-# 1. Setup Rate Limiter
+# 1. Setup Rate Limiter (Prevents one user from breaking your API)
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Stable Instagram API")
+app = FastAPI(title="Lovable Backend API")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# 2. Simple Manual Cache (Dictionary)
-# This replaces the unreliable fastapi-cache library
+# 2. Enable CORS (Required for Lovable/Frontend to work)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"], # In production, replace "*" with your Lovable site URL
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# 3. High-Speed Memory Cache
 INTERNAL_CACHE = {}
-CACHE_EXPIRATION = 3600 # 1 hour
+CACHE_TIME = 3600  # Data stays fresh for 1 hour
 
 # --- CONFIGURATION ---
 PROXY_URL = "http://tyzozoto-rotate:6c23wyc9oc1r@p.webshare.io:80"
@@ -28,65 +35,58 @@ COOKIES = {
     "sessionid": "80010991653%3AvmA5lUgf0xOt7T%3A10%3AAYgn1yV_ZHAxNDo2je3EsHExh1F3F9saczllIeSQmg"
 }
 
-@app.get("/")
-def home():
-    return {"status": "API Online", "cache_size": len(INTERNAL_CACHE)}
-
 @app.get("/profile/{username}")
-@limiter.limit("10/minute")
-async def get_instagram_profile(request: Request, username: str):
-    username = username.lower().strip()
-    
-    # Check Manual Cache
-    if username in INTERNAL_CACHE:
-        cached_data, timestamp = INTERNAL_CACHE[username]
-        if time.time() - timestamp < CACHE_EXPIRATION:
-            cached_data["source"] = "cache"
-            return cached_data
+@limiter.limit("10/minute") # Each visitor can search 10 times per minute
+async def get_profile(request: Request, username: str):
+    user_key = username.lower().strip()
 
-    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    # Check Cache first (Saves your proxy & account from extra load)
+    if user_key in INTERNAL_CACHE:
+        data, expiry = INTERNAL_CACHE[user_key]
+        if time.time() < expiry:
+            return {"source": "cache", "data": data}
+
+    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={user_key}"
     
     headers = {
         "x-ig-app-id": "936619743392459",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "referer": f"https://www.instagram.com/{username}/",
+        "referer": "https://www.instagram.com/",
         "x-requested-with": "XMLHttpRequest",
     }
 
     try:
+        # Chrome 120 Impersonation (Best for bypassing blocks)
         response = requests.get(
             url,
             headers=headers,
             cookies=COOKIES,
             proxies={"http": PROXY_URL, "https": PROXY_URL},
             impersonate="chrome120",
-            timeout=25
+            timeout=20
         )
 
         if response.status_code != 200:
-            return {"error": f"Instagram Error {response.status_code}"}
+            raise HTTPException(status_code=response.status_code, detail="Instagram block")
 
-        json_data = response.json()
-        user = json_data.get("data", {}).get("user")
-        
-        if not user:
-            return {"error": "Soft Blocked", "msg": "Instagram returned empty data."}
+        raw_data = response.json().get("data", {}).get("user")
+        if not raw_data:
+            return {"error": "Account not found or private info hidden"}
 
-        profile_data = {
-            "source": "live",
-            "username": user.get("username"),
-            "full_name": user.get("full_name"),
-            "followers": user.get("edge_followed_by", {}).get("count"),
-            "following": user.get("edge_follow", {}).get("count"),
-            "posts": user.get("edge_owner_to_timeline_media", {}).get("count"),
-            "bio": user.get("biography"),
-            "dp": user.get("profile_pic_url_hd")
+        # Prepare clean data for your Lovable site
+        clean_data = {
+            "username": raw_data.get("username"),
+            "full_name": raw_data.get("full_name"),
+            "followers": raw_data.get("edge_followed_by", {}).get("count"),
+            "bio": raw_data.get("biography"),
+            "profile_pic": raw_data.get("profile_pic_url_hd"),
+            "is_private": raw_data.get("is_private")
         }
 
-        # Save to Manual Cache
-        INTERNAL_CACHE[username] = (profile_data, time.time())
+        # Save to cache
+        INTERNAL_CACHE[user_key] = (clean_data, time.time() + CACHE_TIME)
         
-        return profile_data
+        return {"source": "live", "data": clean_data}
 
     except Exception as e:
-        return {"error": "Request Failed", "details": str(e)}
+        return {"error": "Connection issue", "details": str(e)}
