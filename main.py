@@ -2,7 +2,6 @@ from fastapi import FastAPI, HTTPException
 import httpx
 import logging
 
-# Setup logging to help you see errors in Railway logs
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -35,18 +34,18 @@ async def get_instagram_profile(username: str):
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     
     try:
+        # We use http2=True here which now works because of the requirements.txt update
         async with httpx.AsyncClient(http2=True, follow_redirects=True) as client:
             response = await client.get(url, headers=HEADERS, timeout=20.0)
             
             if response.status_code != 200:
-                logger.error(f"Instagram Error: {response.status_code}")
-                return {"error": f"Instagram returned {response.status_code}", "body": response.text[:200]}
+                return {"error": f"Instagram Error {response.status_code}", "body_preview": response.text[:200]}
 
             data = response.json()
             user = data.get("data", {}).get("user")
             
             if not user:
-                return {"error": "User data missing from response", "raw": data}
+                return {"error": "Soft Block: Instagram returned status OK but hidden data.", "raw": data}
 
             return {
                 "username": user.get("username"),
@@ -59,5 +58,5 @@ async def get_instagram_profile(username: str):
             }
 
     except Exception as e:
-        logger.exception("Application Crash:")
+        logger.exception("Crash Log:")
         return {"error": "Internal Server Error", "message": str(e)}
