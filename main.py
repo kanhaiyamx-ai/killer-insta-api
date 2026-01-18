@@ -1,29 +1,35 @@
 import time
 import random
-from fastapi import FastAPI, Request, HTTPException
+import logging
+from fastapi import FastAPI, Request, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from curl_cffi import requests
 
-# 1. Setup Rate Limiter (Prevents one user from breaking your API)
+# 1. Setup Logging (Essential for debugging on Railway)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# 2. Setup Rate Limiter
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Lovable Backend API")
+app = FastAPI(title="Lovable Production API")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# 2. Enable CORS (Required for Lovable/Frontend to work)
+# 3. Enable CORS for Lovable
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, replace "*" with your Lovable site URL
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# 3. High-Speed Memory Cache
+# 4. Memory Cache
 INTERNAL_CACHE = {}
-CACHE_TIME = 3600  # Data stays fresh for 1 hour
+CACHE_EXPIRY = 3600 
 
 # --- CONFIGURATION ---
 PROXY_URL = "http://tyzozoto-rotate:6c23wyc9oc1r@p.webshare.io:80"
@@ -36,18 +42,18 @@ COOKIES = {
 }
 
 @app.get("/profile/{username}")
-@limiter.limit("10/minute") # Each visitor can search 10 times per minute
-async def get_profile(request: Request, username: str):
+@limiter.limit("10/minute")
+async def get_instagram_profile(request: Request, username: str):
     user_key = username.lower().strip()
 
-    # Check Cache first (Saves your proxy & account from extra load)
+    # --- CACHE CHECK ---
     if user_key in INTERNAL_CACHE:
-        data, expiry = INTERNAL_CACHE[user_key]
-        if time.time() < expiry:
-            return {"source": "cache", "data": data}
+        data, timestamp = INTERNAL_CACHE[user_key]
+        if time.time() - timestamp < CACHE_EXPIRY:
+            return {"status": "success", "source": "cache", "data": data}
 
+    # --- API REQUEST ---
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={user_key}"
-    
     headers = {
         "x-ig-app-id": "936619743392459",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -56,37 +62,60 @@ async def get_profile(request: Request, username: str):
     }
 
     try:
-        # Chrome 120 Impersonation (Best for bypassing blocks)
         response = requests.get(
             url,
             headers=headers,
             cookies=COOKIES,
             proxies={"http": PROXY_URL, "https": PROXY_URL},
             impersonate="chrome120",
-            timeout=20
+            timeout=15
         )
 
+        # Handle HTTP Errors
+        if response.status_code == 404:
+            raise HTTPException(status_code=404, detail="Instagram user not found.")
+        
+        if response.status_code == 429:
+            raise HTTPException(status_code=429, detail="Rate limit reached on Instagram. Please wait.")
+
         if response.status_code != 200:
-            raise HTTPException(status_code=response.status_code, detail="Instagram block")
+            logger.error(f"IG Error: {response.status_code} - {response.text[:100]}")
+            raise HTTPException(status_code=502, detail="Instagram service unavailable.")
 
-        raw_data = response.json().get("data", {}).get("user")
-        if not raw_data:
-            return {"error": "Account not found or private info hidden"}
+        # Parse Data
+        json_data = response.json()
+        user = json_data.get("data", {}).get("user")
+        
+        if not user:
+            # This is the "Soft Block" - Status 200 but empty data
+            raise HTTPException(status_code=403, detail="Access denied by Instagram (Soft Block).")
 
-        # Prepare clean data for your Lovable site
-        clean_data = {
-            "username": raw_data.get("username"),
-            "full_name": raw_data.get("full_name"),
-            "followers": raw_data.get("edge_followed_by", {}).get("count"),
-            "bio": raw_data.get("biography"),
-            "profile_pic": raw_data.get("profile_pic_url_hd"),
-            "is_private": raw_data.get("is_private")
+        profile_data = {
+            "username": user.get("username"),
+            "full_name": user.get("full_name"),
+            "followers": user.get("edge_followed_by", {}).get("count"),
+            "is_private": user.get("is_private"),
+            "bio": user.get("biography"),
+            "dp": user.get("profile_pic_url_hd")
         }
 
-        # Save to cache
-        INTERNAL_CACHE[user_key] = (clean_data, time.time() + CACHE_TIME)
+        # Save to Cache
+        INTERNAL_CACHE[user_key] = (profile_data, time.time())
         
-        return {"source": "live", "data": clean_data}
+        return {"status": "success", "source": "live", "data": profile_data}
 
+    except requests.exceptions.RequestError as e:
+        logger.error(f"Proxy/Network Error: {str(e)}")
+        raise HTTPException(status_code=503, detail="Proxy connection failed.")
+    
     except Exception as e:
-        return {"error": "Connection issue", "details": str(e)}
+        logger.exception("Unexpected Crash")
+        raise HTTPException(status_code=500, detail="Internal server error.")
+
+# Global Error Handler for cleaner Frontend responses
+@app.exception_handler(HTTPException)
+async def custom_http_exception_handler(request: Request, exc: HTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"status": "error", "message": exc.detail},
+    )
