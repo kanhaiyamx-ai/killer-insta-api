@@ -1,36 +1,22 @@
 import os
 import random
 import time
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
-from fastapi_cache import FastAPICache
-from fastapi_cache.decorator import cache
 from curl_cffi import requests
 
-# Failsafe for Cache Backend Import
-try:
-    from fastapi_cache.backends.in_memory import InMemoryCacheBackend
-except ImportError:
-    try:
-        from fastapi_cache.backends.inmemory import InMemoryCacheBackend
-    except ImportError:
-        InMemoryCacheBackend = None
-
-# 1. Rate Limiter Setup
+# 1. Setup Rate Limiter
 limiter = Limiter(key_func=get_remote_address)
 app = FastAPI(title="Stable Instagram API")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# 2. Cache Initialization with Failsafe
-@app.on_event("startup")
-async def startup():
-    if InMemoryCacheBackend:
-        FastAPICache.init(InMemoryCacheBackend())
-    else:
-        print("Warning: Cache backend not found. API will run without caching.")
+# 2. Simple Manual Cache (Dictionary)
+# This replaces the unreliable fastapi-cache library
+INTERNAL_CACHE = {}
+CACHE_EXPIRATION = 3600 # 1 hour
 
 # --- CONFIGURATION ---
 PROXY_URL = "http://tyzozoto-rotate:6c23wyc9oc1r@p.webshare.io:80"
@@ -44,12 +30,20 @@ COOKIES = {
 
 @app.get("/")
 def home():
-    return {"status": "API is online", "cache_active": InMemoryCacheBackend is not None}
+    return {"status": "API Online", "cache_size": len(INTERNAL_CACHE)}
 
 @app.get("/profile/{username}")
-@limiter.limit("5/minute")
-@cache(expire=3600)
+@limiter.limit("10/minute")
 async def get_instagram_profile(request: Request, username: str):
+    username = username.lower().strip()
+    
+    # Check Manual Cache
+    if username in INTERNAL_CACHE:
+        cached_data, timestamp = INTERNAL_CACHE[username]
+        if time.time() - timestamp < CACHE_EXPIRATION:
+            cached_data["source"] = "cache"
+            return cached_data
+
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     
     headers = {
@@ -72,17 +66,27 @@ async def get_instagram_profile(request: Request, username: str):
         if response.status_code != 200:
             return {"error": f"Instagram Error {response.status_code}"}
 
-        data = response.json().get("data", {}).get("user")
-        if not data:
+        json_data = response.json()
+        user = json_data.get("data", {}).get("user")
+        
+        if not user:
             return {"error": "Soft Blocked", "msg": "Instagram returned empty data."}
 
-        return {
-            "username": data.get("username"),
-            "full_name": data.get("full_name"),
-            "followers": data.get("edge_followed_by", {}).get("count"),
-            "bio": data.get("biography"),
-            "dp": data.get("profile_pic_url_hd")
+        profile_data = {
+            "source": "live",
+            "username": user.get("username"),
+            "full_name": user.get("full_name"),
+            "followers": user.get("edge_followed_by", {}).get("count"),
+            "following": user.get("edge_follow", {}).get("count"),
+            "posts": user.get("edge_owner_to_timeline_media", {}).get("count"),
+            "bio": user.get("biography"),
+            "dp": user.get("profile_pic_url_hd")
         }
+
+        # Save to Manual Cache
+        INTERNAL_CACHE[username] = (profile_data, time.time())
+        
+        return profile_data
 
     except Exception as e:
         return {"error": "Request Failed", "details": str(e)}
