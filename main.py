@@ -3,6 +3,7 @@ import requests
 
 app = FastAPI()
 
+# Your Hardcoded Session Data
 COOKIE_STRING = (
     "mid=aWyxUQALAAEXSQj42YOKQ_p8v8dn; "
     "ig_did=84B2CD1D-1165-40DA-8A06-82419391BA7B; "
@@ -19,15 +20,9 @@ HEADERS = {
     "referer": "https://www.instagram.com/"
 }
 
-@app.get("/test")
-def test_connection():
-    # This checks if your session is actually valid
-    url = "https://www.instagram.com/api/v1/users/web_profile_info/?username=cristiano"
-    response = requests.get(url, headers=HEADERS)
-    return {
-        "status_code": response.status_code,
-        "response_preview": response.text[:500] # Shows the first 500 characters of the error
-    }
+@app.get("/")
+def home():
+    return {"status": "API is online", "usage": "/profile/{username}"}
 
 @app.get("/profile/{username}")
 def get_instagram_profile(username: str):
@@ -37,22 +32,31 @@ def get_instagram_profile(username: str):
         response = requests.get(url, headers=HEADERS, timeout=15)
         
         if response.status_code != 200:
-            return {"error": f"Instagram returned status {response.status_code}", "debug": "/test"}
+            return {"error": f"Instagram returned {response.status_code}", "detail": "Check cookies"}
 
-        json_data = response.json()
-        user_data = json_data.get('data', {}).get('user')
+        raw_data = response.json()
         
-        if not user_data:
-            return {
-                "error": "Invalid response structure",
-                "full_response": json_data # This helps us see what Instagram actually sent
-            }
+        # Safe navigation of the JSON tree
+        data = raw_data.get('data', {})
+        if not data:
+            return {"error": "No data key found", "raw": raw_data}
+            
+        user = data.get('user', {})
+        if not user:
+            return {"error": "User not found or profile is restricted", "raw": raw_data}
 
+        # Success! Return the clean data
         return {
-            "username": user_data.get("username"),
-            "followers": user_data.get("edge_followed_by", {}).get("count"),
-            "bio": user_data.get("biography")
+            "username": user.get("username"),
+            "full_name": user.get("full_name"),
+            "followers": user.get("edge_followed_by", {}).get("count"),
+            "following": user.get("edge_follow", {}).get("count"),
+            "posts": user.get("edge_owner_to_timeline_media", {}).get("count"),
+            "bio": user.get("biography"),
+            "profile_pic": user.get("profile_pic_url_hd"),
+            "is_private": user.get("is_private"),
+            "is_verified": user.get("is_verified")
         }
 
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(status_code=500, detail=str(e))
