@@ -1,25 +1,58 @@
+import os
 import time
-import random
 import logging
-from fastapi import FastAPI, Request, HTTPException, status
+from typing import Optional, Any
+from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from curl_cffi import requests
 
-# 1. Setup Logging (Essential for debugging on Railway)
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# --- 1. LOGGING & CONFIGURATION ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger("IG_API")
 
-# 2. Setup Rate Limiter
+# Use Environment Variables for security (with fallbacks for your current setup)
+PROXY_URL = os.getenv("PROXY_URL", "http://tyzozoto-rotate:6c23wyc9oc1r@p.webshare.io:80")
+SESSION_ID = os.getenv("SESSION_ID", "80010991653%3AvmA5lUgf0xOt7T%3A10%3AAYgn1yV_ZHAxNDo2je3EsHExh1F3F9saczllIeSQmg")
+
+COOKIES = {
+    "mid": "aWyxUQALAAEXSQj42YOKQ_p8v8dn",
+    "ig_did": "84B2CD1D-1165-40DA-8A06-82419391BA7B",
+    "csrftoken": "qVLbVtyryQwyHko3V0Ci8Q",
+    "ds_user_id": "80010991653",
+    "sessionid": SESSION_ID
+}
+
+# --- 2. DATA MODELS (For cleaner documentation) ---
+class ProfileData(BaseModel):
+    username: str
+    full_name: Optional[str] = None
+    followers: int = 0
+    following: int = 0
+    posts: int = 0
+    bio: Optional[str] = None
+    is_private: bool = False
+    dp_url: str
+
+class ApiResponse(BaseModel):
+    success: bool
+    source: str  # "cache" or "live"
+    data: Optional[ProfileData] = None
+    error: Optional[str] = None
+
+# --- 3. APP SETUP ---
 limiter = Limiter(key_func=get_remote_address)
-app = FastAPI(title="Lovable Production API")
+app = FastAPI(title="Lovable Instagram API", version="2.0")
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# 3. Enable CORS for Lovable
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -27,95 +60,123 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 4. Memory Cache
+# Simple In-Memory Cache
 INTERNAL_CACHE = {}
-CACHE_EXPIRY = 3600 
+CACHE_TTL = 3600  # 1 hour
 
-# --- CONFIGURATION ---
-PROXY_URL = "http://tyzozoto-rotate:6c23wyc9oc1r@p.webshare.io:80"
-COOKIES = {
-    "mid": "aWyxUQALAAEXSQj42YOKQ_p8v8dn",
-    "ig_did": "84B2CD1D-1165-40DA-8A06-82419391BA7B",
-    "csrftoken": "qVLbVtyryQwyHko3V0Ci8Q",
-    "ds_user_id": "80010991653",
-    "sessionid": "80010991653%3AvmA5lUgf0xOt7T%3A10%3AAYgn1yV_ZHAxNDo2je3EsHExh1F3F9saczllIeSQmg"
-}
-
-@app.get("/profile/{username}")
-@limiter.limit("10/minute")
-async def get_instagram_profile(request: Request, username: str):
-    user_key = username.lower().strip()
-
-    # --- CACHE CHECK ---
-    if user_key in INTERNAL_CACHE:
-        data, timestamp = INTERNAL_CACHE[user_key]
-        if time.time() - timestamp < CACHE_EXPIRY:
-            return {"status": "success", "source": "cache", "data": data}
-
-    # --- API REQUEST ---
-    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={user_key}"
-    headers = {
+# --- 4. HELPER FUNCTIONS ---
+def get_headers(username: str):
+    return {
         "x-ig-app-id": "936619743392459",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "referer": "https://www.instagram.com/",
+        "referer": f"https://www.instagram.com/{username}/",
         "x-requested-with": "XMLHttpRequest",
     }
 
+# --- 5. ENDPOINTS ---
+
+@app.get("/", tags=["Health"])
+def health_check():
+    """Checks API status and cache size."""
+    return {
+        "status": "online",
+        "cache_items": len(INTERNAL_CACHE),
+        "proxy_configured": bool(PROXY_URL)
+    }
+
+@app.get("/profile/{username}", response_model=ApiResponse, tags=["Instagram"])
+@limiter.limit("10/minute")
+async def fetch_profile(request: Request, username: str):
+    username = username.strip().lower()
+
+    # A. CACHE CHECK
+    if username in INTERNAL_CACHE:
+        data, timestamp = INTERNAL_CACHE[username]
+        if time.time() - timestamp < CACHE_TTL:
+            logger.info(f"Cache hit for {username}")
+            return ApiResponse(success=True, source="cache", data=data)
+        else:
+            del INTERNAL_CACHE[username]  # Expired
+
+    # B. LIVE FETCH
+    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    
     try:
+        logger.info(f"Fetching live data for {username}...")
         response = requests.get(
             url,
-            headers=headers,
+            headers=get_headers(username),
             cookies=COOKIES,
             proxies={"http": PROXY_URL, "https": PROXY_URL},
             impersonate="chrome120",
-            timeout=15
+            timeout=20
         )
 
-        # Handle HTTP Errors
+        # Handle Standard Errors
         if response.status_code == 404:
-            raise HTTPException(status_code=404, detail="Instagram user not found.")
+            return JSONResponse(
+                status_code=404,
+                content={"success": False, "source": "live", "error": "User not found"}
+            )
         
         if response.status_code == 429:
-            raise HTTPException(status_code=429, detail="Rate limit reached on Instagram. Please wait.")
+            logger.warning(f"Rate limit hit for {username}")
+            return JSONResponse(
+                status_code=429,
+                content={"success": False, "source": "live", "error": "Rate limit exceeded. Try again later."}
+            )
 
         if response.status_code != 200:
-            logger.error(f"IG Error: {response.status_code} - {response.text[:100]}")
-            raise HTTPException(status_code=502, detail="Instagram service unavailable.")
+            logger.error(f"IG Error {response.status_code}: {response.text[:100]}")
+            return JSONResponse(
+                status_code=502,
+                content={"success": False, "source": "live", "error": f"Instagram returned {response.status_code}"}
+            )
 
-        # Parse Data
+        # C. PARSE DATA
         json_data = response.json()
         user = json_data.get("data", {}).get("user")
-        
+
         if not user:
-            # This is the "Soft Block" - Status 200 but empty data
-            raise HTTPException(status_code=403, detail="Access denied by Instagram (Soft Block).")
+            logger.warning(f"Soft block detected for {username}")
+            return JSONResponse(
+                status_code=403,
+                content={"success": False, "source": "live", "error": "Instagram Soft Block (Empty Data)"}
+            )
 
-        profile_data = {
-            "username": user.get("username"),
-            "full_name": user.get("full_name"),
-            "followers": user.get("edge_followed_by", {}).get("count"),
-            "is_private": user.get("is_private"),
-            "bio": user.get("biography"),
-            "dp": user.get("profile_pic_url_hd")
-        }
+        clean_data = ProfileData(
+            username=user.get("username"),
+            full_name=user.get("full_name"),
+            followers=user.get("edge_followed_by", {}).get("count", 0),
+            following=user.get("edge_follow", {}).get("count", 0),
+            posts=user.get("edge_owner_to_timeline_media", {}).get("count", 0),
+            bio=user.get("biography"),
+            is_private=user.get("is_private", False),
+            dp_url=user.get("profile_pic_url_hd")
+        )
 
-        # Save to Cache
-        INTERNAL_CACHE[user_key] = (profile_data, time.time())
-        
-        return {"status": "success", "source": "live", "data": profile_data}
+        # D. SAVE TO CACHE
+        INTERNAL_CACHE[username] = (clean_data, time.time())
 
-    except requests.exceptions.RequestError as e:
-        logger.error(f"Proxy/Network Error: {str(e)}")
-        raise HTTPException(status_code=503, detail="Proxy connection failed.")
-    
+        return ApiResponse(success=True, source="live", data=clean_data)
+
+    except requests.RequestsError as e:
+        logger.error(f"Network error: {str(e)}")
+        return JSONResponse(
+            status_code=503,
+            content={"success": False, "source": "error", "error": "Proxy Connection Failed"}
+        )
     except Exception as e:
-        logger.exception("Unexpected Crash")
-        raise HTTPException(status_code=500, detail="Internal server error.")
+        logger.exception(f"Unexpected error for {username}")
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "source": "error", "error": "Internal Server Error"}
+        )
 
-# Global Error Handler for cleaner Frontend responses
-@app.exception_handler(HTTPException)
-async def custom_http_exception_handler(request: Request, exc: HTTPException):
+# Global Exception Handler ensures standardized JSON even on crash
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
     return JSONResponse(
-        status_code=exc.status_code,
-        content={"status": "error", "message": exc.detail},
+        status_code=500,
+        content={"success": False, "error": f"Critical Server Failure: {str(exc)}"}
     )
