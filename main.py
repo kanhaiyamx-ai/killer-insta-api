@@ -1,14 +1,25 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from fastapi_cache import FastAPICache
+from fastapi_cache.backends.inmemory import InMemoryCacheBackend
+from fastapi_cache.decorator import cache
 from curl_cffi import requests
 import random
 import time
-import logging
+import asyncio
 
-# Logging configuration
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# 1. Setup Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
+app = FastAPI(title="Pro IG Scraper API")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-app = FastAPI(title="Ultra Instagram API 2026")
+# 2. Setup In-Memory Cache (Simple for Railway)
+@app.on_event("startup")
+async def startup():
+    FastAPICache.init(InMemoryCacheBackend())
 
 # --- CONFIGURATION ---
 PROXY_URL = "http://tyzozoto-rotate:6c23wyc9oc1r@p.webshare.io:80"
@@ -20,77 +31,59 @@ COOKIES = {
     "sessionid": "80010991653%3AvmA5lUgf0xOt7T%3A10%3AAYgn1yV_ZHAxNDo2je3EsHExh1F3F9saczllIeSQmg"
 }
 
-# List of modern User-Agents to rotate
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-]
-
-def fetch_with_retry(username, retries=3):
-    """Helper function to retry requests if they fail"""
-    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
-    
-    for i in range(retries):
-        try:
-            headers = {
-                "authority": "www.instagram.com",
-                "accept": "*/*",
-                "x-ig-app-id": "936619743392459",
-                "x-asbd-id": "129477",
-                "user-agent": random.choice(USER_AGENTS),
-                "referer": f"https://www.instagram.com/{username}/",
-                "x-requested-with": "XMLHttpRequest",
-            }
-
-            response = requests.get(
-                url,
-                headers=headers,
-                cookies=COOKIES,
-                proxies={"http": PROXY_URL, "https": PROXY_URL},
-                impersonate="chrome110",
-                timeout=20
-            )
-
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("data", {}).get("user"):
-                    return data
-            
-            # If we get a 429 or empty data, wait and retry
-            logger.warning(f"Retry {i+1}/{retries} for {username}. Status: {response.status_code}")
-            time.sleep(random.uniform(2, 4))
-            
-        except Exception as e:
-            logger.error(f"Attempt {i+1} failed: {e}")
-            time.sleep(2)
-            
-    return None
+@app.get("/")
+def home():
+    return {"status": "Pro API Online", "endpoints": ["/profile/{username}"]}
 
 @app.get("/profile/{username}")
-async def get_profile(username: str):
-    result = fetch_with_retry(username)
+@limiter.limit("5/minute")  # Limits each IP to 5 searches per minute
+@cache(expire=3600)         # Saves results for 1 hour (3600 seconds)
+async def get_instagram_profile(request: Request, username: str):
+    """
+    Fetches Instagram data with caching and rate limiting.
+    The @cache decorator ensures that repeat searches are instant.
+    """
+    url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
     
-    if not result:
-        raise HTTPException(status_code=500, detail="Failed to fetch data after multiple attempts. Instagram might be blocking the session.")
-
-    user = result["data"]["user"]
-    return {
-        "account": {
-            "id": user.get("id"),
-            "username": user.get("username"),
-            "full_name": user.get("full_name"),
-            "verified": user.get("is_verified"),
-            "private": user.get("is_private"),
-        },
-        "stats": {
-            "followers": user.get("edge_followed_by", {}).get("count"),
-            "following": user.get("edge_follow", {}).get("count"),
-            "posts": user.get("edge_owner_to_timeline_media", {}).get("count"),
-        },
-        "content": {
-            "bio": user.get("biography"),
-            "profile_pic": user.get("profile_pic_url_hd"),
-            "external_link": user.get("external_url"),
-        }
+    headers = {
+        "authority": "www.instagram.com",
+        "accept": "*/*",
+        "x-ig-app-id": "936619743392459",
+        "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "referer": f"https://www.instagram.com/{username}/",
+        "x-requested-with": "XMLHttpRequest",
     }
+
+    try:
+        # Mimic real browser TLS handshake
+        response = requests.get(
+            url,
+            headers=headers,
+            cookies=COOKIES,
+            proxies={"http": PROXY_URL, "https": PROXY_URL},
+            impersonate="chrome120",
+            timeout=25
+        )
+
+        if response.status_code != 200:
+            return {"error": f"Instagram Error {response.status_code}", "msg": "Session or Proxy issue"}
+
+        data = response.json().get("data", {}).get("user")
+        if not data:
+            return {"error": "Soft Block", "msg": "Instagram returned empty data."}
+
+        # Success Response
+        return {
+            "cached_at": time.ctime(),
+            "username": data.get("username"),
+            "full_name": data.get("full_name"),
+            "followers": data.get("edge_followed_by", {}).get("count"),
+            "following": data.get("edge_follow", {}).get("count"),
+            "posts": data.get("edge_owner_to_timeline_media", {}).get("count"),
+            "bio": data.get("biography"),
+            "is_private": data.get("is_private"),
+            "dp": data.get("profile_pic_url_hd")
+        }
+
+    except Exception as e:
+        return {"error": "Server Error", "details": str(e)}
