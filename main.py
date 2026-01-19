@@ -3,8 +3,7 @@ import time
 import logging
 import asyncio
 import random
-import base64
-from typing import Optional
+from typing import Optional, List
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -14,11 +13,11 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from curl_cffi.requests import AsyncSession
 
-# --- 1. SETUP ---
+# --- 1. PRO-LEVEL LOGGING ---
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("IG_ULTRA_SAFE")
 
-app = FastAPI(title="Image-Proxy IG API")
+app = FastAPI(title="Indestructible IG API")
 request_lock = asyncio.Lock()
 
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -37,7 +36,7 @@ PROXY_POOL = [
 
 ACCOUNT_POOL = [
     {
-        "id": "ACC_PRIMARY",
+        "id": "ACC_NEW_1",
         "status": "healthy",
         "cookies": {
             "mid": "aW5VQQALAAF3Sj_dJkMRaTSD3iWj",
@@ -48,7 +47,7 @@ ACCOUNT_POOL = [
         }
     },
     {
-        "id": "ACC_SECONDARY",
+        "id": "ACC_2",
         "status": "healthy",
         "cookies": {
             "mid": "aW4nQwALAAGpPxvGsX2SJtmNQPqH",
@@ -62,13 +61,20 @@ ACCOUNT_POOL = [
 
 INTERNAL_CACHE = {}
 
-# --- 3. IMAGE PROXY LOGIC ---
+# --- 3. DATA MODELS ---
+class ProfileData(BaseModel):
+    username: str
+    full_name: Optional[str]
+    followers: int
+    following: int  # Fixed: Now included
+    posts: int
+    bio: Optional[str]
+    dp_url: str
+    dp_proxy: str
+
+# --- 4. IMAGE PROXY ENDPOINT ---
 @app.get("/proxy-image")
 async def proxy_image(url: str):
-    """
-    Fetches an image from Instagram via proxy and returns it directly.
-    This prevents '403 Forbidden' errors on the frontend.
-    """
     proxy = random.choice(PROXY_POOL)
     async with AsyncSession(impersonate="chrome120") as session:
         try:
@@ -77,19 +83,12 @@ async def proxy_image(url: str):
                 return Response(content=res.content, media_type="image/jpeg")
         except Exception as e:
             logger.error(f"Image proxy failed: {e}")
-    
     return JSONResponse(status_code=404, content={"error": "Image not found"})
 
-# --- 4. PROFILE FETCH LOGIC ---
-class ProfileData(BaseModel):
-    username: str
-    followers: int
-    bio: Optional[str]
-    dp_url: str      # Original URL
-    dp_proxy: str    # Safe Proxy URL for Lovable
-
+# --- 5. THE FAILOVER FETCH LOGIC ---
 async def fetch_with_failover(username: str):
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    
     active_accounts = [a for a in ACCOUNT_POOL if a["status"] == "healthy"]
     random.shuffle(active_accounts)
     proxies = PROXY_POOL.copy()
@@ -97,55 +96,77 @@ async def fetch_with_failover(username: str):
 
     for i, account in enumerate(active_accounts):
         current_proxy = proxies[i % len(proxies)]
+        
         async with request_lock:
             try:
-                await asyncio.sleep(random.uniform(1.8, 3.5))
+                # Anti-Detection Jitter
+                await asyncio.sleep(random.uniform(2.0, 4.0))
+                
                 async with AsyncSession(impersonate="chrome120") as session:
                     res = await session.get(
                         url,
-                        headers={"x-ig-app-id": "936619743392459", "referer": f"https://www.instagram.com/{username}/"},
+                        headers={
+                            "x-ig-app-id": "936619743392459",
+                            "referer": f"https://www.instagram.com/{username}/",
+                            "x-requested-with": "XMLHttpRequest"
+                        },
                         cookies=account["cookies"],
                         proxies={"http": current_proxy, "https": current_proxy},
                         timeout=15
                     )
+
                     if res.status_code == 200:
                         data = res.json()
                         if data.get("data", {}).get("user"):
                             return {"code": 200, "json": data}
+                    
+                    if res.status_code == 429:
+                        account["status"] = "cooldown"
+                        logger.warning(f"{account['id']} rate limited. Switching...")
+
             except Exception as e:
-                logger.error(f"Fetch failed: {e}")
+                logger.error(f"Attempt failed: {e}")
                 continue
+
     return {"code": 503, "json": None}
 
 @app.get("/profile/{username}")
-@limiter.limit("8/minute")
+@limiter.limit("10/minute")
 async def get_profile(request: Request, username: str):
     username = username.strip().lower()
-    
+
+    # Cache Check
     if username in INTERNAL_CACHE:
         data, ts = INTERNAL_CACHE[username]
         if time.time() - ts < 3600:
-            return {"success": True, "data": data}
+            return {"success": True, "source": "cache", "data": data}
 
     result = await fetch_with_failover(username)
     
     if result["code"] == 200:
-        u = result["json"]["data"]["user"]
-        original_dp = u["profile_pic_url_hd"]
-        
-        # We generate a stable proxy link for the frontend
-        # Example: https://your-app.railway.app/proxy-image?url=...
-        base_url = str(request.base_url).rstrip("/")
-        dp_proxy_url = f"{base_url}/proxy-image?url={original_dp}"
+        try:
+            u = result["json"]["data"]["user"]
+            
+            # Helper for Base URL
+            base_url = str(request.base_url).rstrip("/")
+            
+            # FULL PARSING (Including Following)
+            profile = ProfileData(
+                username=u.get("username", username),
+                full_name=u.get("full_name"),
+                followers=u.get("edge_followed_by", {}).get("count", 0),
+                following=u.get("edge_follow", {}).get("count", 0), # FIXED
+                posts=u.get("edge_owner_to_timeline_media", {}).get("count", 0),
+                bio=u.get("biography"),
+                dp_url=u.get("profile_pic_url_hd", ""),
+                dp_proxy=f"{base_url}/proxy-image?url={u.get('profile_pic_url_hd', '')}"
+            )
+            
+            INTERNAL_CACHE[username] = (profile, time.time())
+            return {"success": True, "source": "live", "data": profile}
+            
+        except Exception as e:
+            logger.error(f"Parsing error: {e}")
+            return JSONResponse(status_code=500, content={"success": False, "error": "Data parsing error"})
 
-        p = ProfileData(
-            username=u["username"],
-            followers=u["edge_followed_by"]["count"],
-            bio=u["biography"],
-            dp_url=original_dp,
-            dp_proxy=dp_proxy_url
-        )
-        INTERNAL_CACHE[username] = (p, time.time())
-        return {"success": True, "data": p}
-
-    return JSONResponse(status_code=result["code"], content={"success": False, "error": "API Error"})
+    return JSONResponse(status_code=result["code"], content={"success": False, "error": "Instagram block or network error"})
