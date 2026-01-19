@@ -2,8 +2,9 @@ import os
 import time
 import logging
 import asyncio
+import random
 from typing import Optional
-from fastapi import FastAPI, Request, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -20,7 +21,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger("IG_API")
 
-app = FastAPI(title="High-Performance IG API", version="3.0")
+app = FastAPI(title="Multi-Account IG API", version="4.0")
 
 # Enable CORS for Lovable
 app.add_middleware(
@@ -30,24 +31,35 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Rate Limiting (Crucial for 50 users)
+# Rate Limiting
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 # --- 2. CONFIGURATION ---
 PROXY_URL = os.getenv("PROXY_URL", "http://tyzozoto-rotate:6c23wyc9oc1r@p.webshare.io:80")
-SESSION_ID = os.getenv("SESSION_ID", "80010991653%3AvmA5lUgf0xOt7T%3A10%3AAYgn1yV_ZHAxNDo2je3EsHExh1F3F9saczllIeSQmg")
 
-COOKIES = {
-    "mid": "aWyxUQALAAEXSQj42YOKQ_p8v8dn",
-    "ig_did": "84B2CD1D-1165-40DA-8A06-82419391BA7B",
-    "csrftoken": "qVLbVtyryQwyHko3V0Ci8Q",
-    "ds_user_id": "80010991653",
-    "sessionid": SESSION_ID
-}
+# --- ACCOUNT POOL (Rotation System) ---
+ACCOUNT_POOL = [
+    # Account 1 (Original)
+    {
+        "mid": "aWyxUQALAAEXSQj42YOKQ_p8v8dn",
+        "ig_did": "84B2CD1D-1165-40DA-8A06-82419391BA7B",
+        "csrftoken": "qVLbVtyryQwyHko3V0Ci8Q",
+        "ds_user_id": "80010991653",
+        "sessionid": "80010991653%3AvmA5lUgf0xOt7T%3A10%3AAYgn1yV_ZHAxNDo2je3EsHExh1F3F9saczllIeSQmg"
+    },
+    # Account 2 (New)
+    {
+        "mid": "aW4nQwALAAGpPxvGsX2SJtmNQPqH",
+        "ig_did": "38AA571B-E4A8-4CF8-A5C6-56EE1ED490E7",
+        "csrftoken": "7L-zwQQPpr6ohqm9-XTctF",
+        "ds_user_id": "80062988095",
+        "sessionid": "80062988095%3AsoQ4CkWt17Md8Q%3A13%3AAYjHG1Sn0vhkBk-8jmbiUBB_NXXLs1oQCS0NIXATYg"
+    }
+]
 
-# In-Memory Cache (Fastest option for Railway)
+# In-Memory Cache
 INTERNAL_CACHE = {}
 CACHE_TTL = 3600  # 1 hour
 
@@ -68,13 +80,13 @@ class ApiResponse(BaseModel):
     data: Optional[ProfileData] = None
     error: Optional[str] = None
 
-# --- 4. CORE FETCH FUNCTION (ASYNC) ---
+# --- 4. CORE FETCH FUNCTION ---
 async def fetch_from_instagram(username: str, retries=2) -> dict:
     """
-    Fetches data using AsyncSession (Non-blocking).
-    Retries automatically if the proxy fails.
+    Fetches data using random account rotation.
     """
     url = f"https://www.instagram.com/api/v1/users/web_profile_info/?username={username}"
+    
     headers = {
         "x-ig-app-id": "936619743392459",
         "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -83,31 +95,35 @@ async def fetch_from_instagram(username: str, retries=2) -> dict:
     }
 
     for attempt in range(retries + 1):
+        # ROTATION LOGIC: Pick a random account for each attempt
+        current_account = random.choice(ACCOUNT_POOL)
+        account_id = current_account.get("ds_user_id", "unknown")
+        
         try:
-            # AsyncSession is the key to handling 50+ users
+            logger.info(f"Fetching {username} using Account: {account_id}")
+            
             async with AsyncSession(impersonate="chrome120") as session:
                 response = await session.get(
                     url,
                     headers=headers,
-                    cookies=COOKIES,
+                    cookies=current_account, # Use the selected account's cookies
                     proxies={"http": PROXY_URL, "https": PROXY_URL},
                     timeout=15
                 )
 
-                # Success
                 if response.status_code == 200:
                     return {"status": 200, "json": response.json()}
                 
-                # Handle Rate Limit / Not Found
-                if response.status_code in [404, 429]:
-                    return {"status": response.status_code, "json": None}
+                if response.status_code == 404:
+                    return {"status": 404, "json": None}
 
-                logger.warning(f"Attempt {attempt+1} failed: {response.status_code}")
+                # If blocked (429/Challenge), log it and retry with (likely) the other account
+                logger.warning(f"Account {account_id} failed with {response.status_code}. Retrying...")
 
         except Exception as e:
-            logger.error(f"Network Error on attempt {attempt+1}: {e}")
+            logger.error(f"Network Error: {e}")
             if attempt < retries:
-                await asyncio.sleep(1) # Wait 1s before retry
+                await asyncio.sleep(0.5)
 
     return {"status": 503, "json": None}
 
@@ -117,12 +133,12 @@ async def fetch_from_instagram(username: str, retries=2) -> dict:
 def system_status():
     return {
         "status": "operational",
-        "cache_size": len(INTERNAL_CACHE),
-        "proxy": "configured"
+        "accounts_loaded": len(ACCOUNT_POOL),
+        "cache_size": len(INTERNAL_CACHE)
     }
 
 @app.get("/profile/{username}", response_model=ApiResponse)
-@limiter.limit("15/minute") # Increased limit for active users
+@limiter.limit("20/minute") # Higher limit now that we have 2 accounts
 async def get_profile(request: Request, username: str):
     username = username.strip().lower()
 
@@ -132,26 +148,23 @@ async def get_profile(request: Request, username: str):
         if time.time() - timestamp < CACHE_TTL:
             return ApiResponse(success=True, source="cache", data=data)
         else:
-            del INTERNAL_CACHE[username] # Remove expired
+            del INTERNAL_CACHE[username]
 
-    # B. Fetch Data (Non-Blocking)
+    # B. Fetch Data (Rotated)
     result = await fetch_from_instagram(username)
     status_code = result["status"]
     
     if status_code == 404:
         return JSONResponse(status_code=404, content={"success": False, "source": "live", "error": "User not found"})
     
-    if status_code == 429:
-        return JSONResponse(status_code=429, content={"success": False, "source": "live", "error": "Rate limited"})
-    
     if status_code != 200 or not result["json"]:
-        return JSONResponse(status_code=502, content={"success": False, "source": "error", "error": "Proxy/Instagram Error"})
+        return JSONResponse(status_code=502, content={"success": False, "source": "error", "error": "Instagram unavailable"})
 
-    # C. Parse & Validate
+    # C. Parse
     try:
         user = result["json"].get("data", {}).get("user")
         if not user:
-            return JSONResponse(status_code=403, content={"success": False, "source": "live", "error": "Private/Soft Block"})
+            return JSONResponse(status_code=403, content={"success": False, "source": "live", "error": "Soft Block"})
 
         profile = ProfileData(
             username=user["username"],
@@ -164,10 +177,8 @@ async def get_profile(request: Request, username: str):
             dp_url=user["profile_pic_url_hd"]
         )
 
-        # Update Cache
         INTERNAL_CACHE[username] = (profile, time.time())
-
         return ApiResponse(success=True, source="live", data=profile)
 
-    except KeyError:
+    except Exception:
         return JSONResponse(status_code=500, content={"success": False, "source": "error", "error": "Data parsing failed"})
